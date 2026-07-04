@@ -1,0 +1,179 @@
+name: Build ESP32-DIV V1 GHOST Firmware
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install Arduino CLI
+        uses: arduino/setup-arduino-cli@v2
+
+      - name: Configure Arduino ESP32 core
+        run: |
+          arduino-cli config init --overwrite
+          arduino-cli config add board_manager.additional_urls https://raw.githubusercontent.com/espressif/arduino-esp32/gh-pages/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.10
+
+      - name: Install project libraries
+        run: |
+          mkdir -p "$HOME/Arduino/libraries"
+
+          if [ -d "Libraries" ]; then
+            cp -R Libraries/* "$HOME/Arduino/libraries/" || true
+          fi
+
+          arduino-cli lib install "TFT_eSPI" || true
+          arduino-cli lib install "PCF8574" || true
+          arduino-cli lib install "rc-switch" || true
+          arduino-cli lib install "RF24" || true
+          arduino-cli lib install "ArduinoJson" || true
+          arduino-cli lib install "Adafruit NeoPixel" || true
+          arduino-cli lib install "NimBLE-Arduino" || true
+          arduino-cli lib install "IRremoteESP8266" || true
+          arduino-cli lib install "XPT2046_Touchscreen" || true
+          arduino-cli lib install "TinyGPSPlus" || true
+          arduino-cli lib install "MFRC522" || true
+
+      - name: Force ESP32-DIV V1 board config
+        run: |
+          cat > ESP32-DIV/BoardConfig.h <<'EOF'
+          #pragma once
+
+          // Select the hardware target.
+          // Leave all lines commented to use the ESP32-DIV V2 wiring.
+
+          // #define BOARD_CYD
+          #define BOARD_ESP32_DIV_V1
+          // #define BOARD_ESP32_DIV_V2
+
+          // Set to 0 to hide the on-screen touch nav bar.
+          #define TOUCH_BUTTON_CUE_ENABLED 1
+
+          // Optional fixed PCF8574 I2C address.
+          //#define pcf_ADDR 0x20
+
+          // Optional per-board touch calibration overrides.
+          //#define TOUCH_X_MIN 200
+          //#define TOUCH_X_MAX 3700
+          //#define TOUCH_Y_MIN 240
+          //#define TOUCH_Y_MAX 3800
+
+          #if !defined(BOARD_ESP32_DIV_V2) && !defined(BOARD_CYD) && !defined(BOARD_ESP32_DIV_V1)
+          #define BOARD_ESP32_DIV_V2
+          #endif
+          EOF
+
+      - name: Add safe GHOST screen module
+        run: |
+          cat > ESP32-DIV/ghost_control.h <<'EOF'
+          #pragma once
+
+          #include <Arduino.h>
+          #include <TFT_eSPI.h>
+
+          extern TFT_eSPI tft;
+
+          namespace GhostControl {
+
+          static void drawRow(int y, const char* left, const char* right, uint16_t color) {
+            tft.setTextSize(1);
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.setCursor(12, y);
+            tft.print(left);
+
+            tft.setTextColor(color, TFT_BLACK);
+            tft.setCursor(160, y);
+            tft.print(right);
+          }
+
+          static void runSplash() {
+            tft.fillScreen(TFT_BLACK);
+
+            tft.drawRect(4, 4, tft.width() - 8, tft.height() - 8, TFT_ORANGE);
+
+            tft.setTextColor(TFT_ORANGE, TFT_BLACK);
+            tft.setTextSize(2);
+            tft.setCursor(12, 18);
+            tft.print("M.D.C GHOST");
+
+            tft.setTextColor(TFT_WHITE, TFT_BLACK);
+            tft.setTextSize(1);
+            tft.setCursor(12, 48);
+            tft.print("GHOST / GAON FIELD CONTROL");
+
+            tft.drawFastHLine(12, 70, tft.width() - 24, TFT_DARKGREY);
+
+            drawRow(92,  "GHOST CORE", "READY",    TFT_GREEN);
+            drawRow(116, "GAON-01",    "STANDBY",  TFT_ORANGE);
+            drawRow(140, "GAON-02",    "STANDBY",  TFT_ORANGE);
+            drawRow(164, "GAON-03",    "STANDBY",  TFT_ORANGE);
+            drawRow(188, "MODE",       "PASSIVE",  TFT_CYAN);
+            drawRow(212, "RF TX",      "DISABLED", TFT_RED);
+
+            delay(2500);
+          }
+
+          }
+          EOF
+
+      - name: Patch ESP32-DIV sketch with GHOST startup screen
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          p = Path("ESP32-DIV/ESP32-DIV.ino")
+          s = p.read_text(encoding="utf-8", errors="ignore")
+
+          if '#include "ghost_control.h"' not in s:
+              s = s.replace('#include "utils.h"', '#include "utils.h" #include "ghost_control.h"')
+
+          marker = 'displayLogo(TFT_WHITE, 500);'
+          insert = 'displayLogo(TFT_WHITE, 500); GhostControl::runSplash();'
+
+          if 'GhostControl::runSplash();' not in s:
+              if marker not in s:
+                  raise SystemExit("Patch point not found: displayLogo(TFT_WHITE, 500);")
+              s = s.replace(marker, insert, 1)
+
+          p.write_text(s, encoding="utf-8")
+          PY
+
+      - name: Compile firmware
+        run: |
+          mkdir -p build
+
+          arduino-cli compile \
+            --fqbn "esp32:esp32:esp32s3:UploadSpeed=921600,FlashSize=16M,PartitionScheme=min_spiffs" \
+            --output-dir build \
+            ESP32-DIV
+
+      - name: Prepare firmware.bin
+        run: |
+          echo "Generated files:"
+          find build -type f -maxdepth 2 -print
+
+          MAIN_BIN="$(find build -type f -name '*.bin' ! -name '*bootloader*' ! -name '*partitions*' | head -n 1)"
+
+          if [ -z "$MAIN_BIN" ]; then
+            echo "No main firmware BIN found"
+            exit 1
+          fi
+
+          cp "$MAIN_BIN" firmware.bin
+          ls -lh firmware.bin
+
+      - name: Upload firmware artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ESP32-DIV-V1-GHOST-firmware
+          path: firmware.bin
